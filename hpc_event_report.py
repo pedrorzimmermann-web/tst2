@@ -26,6 +26,33 @@ RE_GPU = re.compile(
     re.IGNORECASE
 )
 
+# Marca o início de cada sub-evento dentro de "Detalhes" (ex.: "[2026-08-07 10:41:01]")
+RE_EVENT_MARKER = re.compile(r"(\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\])")
+
+def humanize_detail(detail: str) -> str:
+    """
+    "Detalhes" do Monit concatena vários sub-eventos numa única string,
+    cada um iniciado por "[AAAA-MM-DD HH:MM:SS]". Aqui a gente normaliza
+    espaços/quebras internas e reinsere uma quebra de linha antes de cada
+    marcador, para exibição legível no drill-down.
+    """
+    d = (detail or "").replace("\r", "").strip()
+    d = re.sub(r"\s+", " ", d)
+
+    parts = RE_EVENT_MARKER.split(d)
+    if len(parts) <= 1:
+        return d
+
+    lines = []
+    if parts[0].strip():
+        lines.append(parts[0].strip())
+    for i in range(1, len(parts), 2):
+        marker = parts[i]
+        rest = parts[i + 1] if i + 1 < len(parts) else ""
+        lines.append((marker + rest).strip())
+
+    return "\n".join(lines)
+
 def parse_dt(s: str):
     # formato do CSV: "2026-08-17 09:41:34"
     try:
@@ -118,14 +145,12 @@ def generate_reports(rows, days_window: int, top_n: int = 15):
                     snippet = snippet[:220] + "..."
                 samples[host][c].append(f"{r['Date']} | {snippet}")
 
-        detail_clean = (r["Detalhes"] or "").replace("\r", "").strip()
-        detail_clean = re.sub(r"\s+", " ", detail_clean)
         host_events[host].append({
             "date": r["Date"],
             "dt": r["Date_dt"],
             "status": r["Status"],
             "cats": cats,
-            "detail": detail_clean,
+            "detail": humanize_detail(r["Detalhes"]),
         })
 
     # Ordenação: prioriza GPU, depois GPU temp, depois sensor temp, IB, total
