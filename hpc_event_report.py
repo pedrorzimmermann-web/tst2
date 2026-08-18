@@ -365,12 +365,17 @@ def render_host_detail_table(host: str, host_events: dict):
 
     rows_html = []
     for e in shown:
-        cats = ", ".join(sorted(e["cats"])) if e["cats"] else "-"
+        if e["cats"]:
+            cats_html = "".join(
+                f"<span class='badge badge-match'>{html.escape(c)}</span>" for c in sorted(e["cats"])
+            )
+        else:
+            cats_html = "<span class='badge badge-none'>sem correspondência</span>"
         rows_html.append(
             "<tr>"
             f"<td class='mono'>{html.escape(e['date'])}</td>"
             f"<td>{html.escape(e['status'])}</td>"
-            f"<td>{html.escape(cats)}</td>"
+            f"<td>{cats_html}</td>"
             f"<td class='detail-cell'>{html.escape(e['detail'])}</td>"
             "</tr>"
         )
@@ -414,11 +419,19 @@ def render_top_hosts_table_html(agg: dict, top_n: int, id_prefix: str):
         chevron_id = f"{id_prefix}-chevron-{i}"
         t = agg["per_host_total"]
         c = agg["per_host_cat"]
+        matched = (c["gpu"][h] + c["gpu_temp"][h] + c["sensor_temp"][h] + c["ib"][h]) > 0
+        match_badge = (
+            "<span class='badge badge-match'>&#10003; regra identificada</span>" if matched
+            else "<span class='badge badge-none'>sem correspondência</span>"
+        )
         table_rows.append(
-            f"<tr class='host-row' onclick=\"toggleDetail('{detail_id}', '{chevron_id}')\">"
+            "<tr class='host-row' "
+            f"data-host='{html.escape(h)}' data-detail-id='{detail_id}' "
+            f"onclick=\"toggleDetail('{detail_id}', '{chevron_id}')\">"
             "<td class='mono'>"
             f"<span class='chevron' id='{chevron_id}'>&#9656;</span> {html.escape(h)}"
             "</td>"
+            f"<td>{match_badge}</td>"
             f"<td class='num'>{t[h]}</td>"
             f"<td>{bar(t[h])}</td>"
             f"<td class='num'>{c['gpu'][h]}</td>"
@@ -429,7 +442,7 @@ def render_top_hosts_table_html(agg: dict, top_n: int, id_prefix: str):
         )
         table_rows.append(
             f"<tr class='detail-row' id='{detail_id}'>"
-            "<td colspan='7'>"
+            "<td colspan='8'>"
             f"<div class='detail-wrap'>{render_host_detail_table(h, agg['host_events'])}</div>"
             "</td></tr>"
         )
@@ -437,7 +450,7 @@ def render_top_hosts_table_html(agg: dict, top_n: int, id_prefix: str):
     return (
         "<table>"
         "<thead><tr>"
-        "<th>Hostname</th><th>Total</th><th>Visual</th><th>GPU</th><th>GPU Temp</th><th>Sensor Temp</th><th>IB</th>"
+        "<th>Hostname</th><th>Correspondência</th><th>Total</th><th>Visual</th><th>GPU</th><th>GPU Temp</th><th>Sensor Temp</th><th>IB</th>"
         "</tr></thead>"
         f"<tbody>{''.join(table_rows)}</tbody>"
         "</table>"
@@ -453,9 +466,15 @@ def render_html_report(report_data: dict, top_n: int = 15):
         for idx, c in enumerate(clusters_sorted):
             t = cluster_aggs[c]["totals"]
             anchor = f"cluster-{idx}"
+            cluster_matched = (t["gpu"] + t["gpu_temp"] + t["sensor_temp"] + t["ib"]) > 0
+            match_badge = (
+                "<span class='badge badge-match'>&#10003; regra identificada</span>" if cluster_matched
+                else "<span class='badge badge-none'>sem correspondência</span>"
+            )
             index_rows.append(
                 "<tr>"
                 f"<td class='mono'><a href='#{anchor}'>{html.escape(c)}</a></td>"
+                f"<td>{match_badge}</td>"
                 f"<td class='num'>{t['hosts_afetados']}</td>"
                 f"<td class='num'>{t['total_events']}</td>"
                 f"<td class='num'>{t['gpu']}</td>"
@@ -465,8 +484,10 @@ def render_html_report(report_data: dict, top_n: int = 15):
                 "</tr>"
             )
             sections.append(
-                f"<h2 id='{anchor}'>Cluster: {html.escape(c)}</h2>"
+                f"<div class='cluster-section' id='{anchor}' data-cluster-section>"
+                f"<h2>Cluster: {html.escape(c)}</h2>"
                 + render_top_hosts_table_html(cluster_aggs[c], top_n, id_prefix=f"c{idx}")
+                + "</div>"
             )
 
         body_main = f"""
@@ -474,7 +495,7 @@ def render_html_report(report_data: dict, top_n: int = 15):
   <table>
     <thead>
       <tr>
-        <th>Cluster</th><th>Hosts afetados</th><th>Total</th><th>GPU</th><th>GPU Temp</th><th>Sensor Temp</th><th>IB</th>
+        <th>Cluster</th><th>Correspondência</th><th>Hosts afetados</th><th>Total</th><th>GPU</th><th>GPU Temp</th><th>Sensor Temp</th><th>IB</th>
       </tr>
     </thead>
     <tbody>
@@ -486,8 +507,10 @@ def render_html_report(report_data: dict, top_n: int = 15):
 """
     else:
         body_main = f"""
+  <div class="cluster-section" data-cluster-section>
   <h2>Top hosts (consolidado)</h2>
   {render_top_hosts_table_html(report_data["global_agg"], top_n, id_prefix="g")}
+  </div>
 """
 
     html_out = f"""<!doctype html>
@@ -511,6 +534,20 @@ def render_html_report(report_data: dict, top_n: int = 15):
   .note {{ background: #fff7e6; padding: 10px 12px; border: 1px solid #f1d28a; border-radius: 8px; }}
   .note-small {{ color: #666; font-size: 0.85em; margin: 6px 2px; }}
 
+  .toolbar {{ display: flex; align-items: center; gap: 10px; margin: 16px 0; }}
+  .toolbar input[type="text"] {{
+    flex: 0 1 320px; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 0.95em;
+  }}
+  .toolbar input[type="text"]:focus {{ outline: 2px solid #8ab4f8; border-color: #8ab4f8; }}
+  #searchCount {{ color: #666; font-size: 0.85em; }}
+
+  .badge {{
+    display: inline-block; padding: 2px 9px; border-radius: 999px;
+    font-size: 0.82em; font-weight: 600; white-space: nowrap;
+  }}
+  .badge-match {{ background: #e6f7ec; color: #0b7a3b; }}
+  .badge-none {{ background: #eef1f5; color: #5b6b7c; }}
+
   tr.host-row {{ cursor: pointer; }}
   tr.host-row:hover {{ background: #f0f7ff; }}
   .chevron {{ display: inline-block; transition: transform .15s ease; }}
@@ -533,6 +570,11 @@ def render_html_report(report_data: dict, top_n: int = 15):
   <div class="note">
     <b>Orientação operacional:</b> priorizar abertura de registros individuais para hosts com maior reincidência (GPU/IB) e tratar aos poucos.
   </div>
+
+  <div class="toolbar">
+    <input type="text" id="hostSearch" placeholder="Buscar host..." oninput="filterHosts(this.value)" autocomplete="off"/>
+    <span id="searchCount"></span>
+  </div>
   {body_main}
   <h2>Detalhes e evidências (texto)</h2>
   <pre>{html.escape(report_data["report_txt"])}</pre>
@@ -544,6 +586,35 @@ def render_html_report(report_data: dict, top_n: int = 15):
       if (!row) return;
       row.classList.toggle('open');
       if (chevron) chevron.classList.toggle('rotated');
+    }}
+
+    function filterHosts(term) {{
+      term = term.trim().toLowerCase();
+      var hostRows = document.querySelectorAll('tr.host-row');
+      var visible = 0;
+
+      hostRows.forEach(function(row) {{
+        var host = (row.getAttribute('data-host') || '').toLowerCase();
+        var match = !term || host.indexOf(term) !== -1;
+
+        row.style.display = match ? '' : 'none';
+        var detail = document.getElementById(row.getAttribute('data-detail-id'));
+        if (detail) detail.style.display = match ? '' : 'none';
+        if (match) visible++;
+      }});
+
+      var counter = document.getElementById('searchCount');
+      if (counter) {{
+        counter.textContent = term ? (visible + ' de ' + hostRows.length + ' hosts') : '';
+      }}
+
+      document.querySelectorAll('[data-cluster-section]').forEach(function(section) {{
+        var anyVisible = false;
+        section.querySelectorAll('tr.host-row').forEach(function(row) {{
+          if (row.style.display !== 'none') anyVisible = true;
+        }});
+        section.style.display = (!term || anyVisible) ? '' : 'none';
+      }});
     }}
   </script>
 </body>
