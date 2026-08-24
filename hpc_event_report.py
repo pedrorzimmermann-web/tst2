@@ -30,9 +30,11 @@ _COMPILED_RULES = [
 FIXED_COLUMNS_HTML = 4
 DETAIL_COLSPAN = FIXED_COLUMNS_HTML + len(CATEGORIES) + 4
 
-# Máximo de eventos individuais exibidos por host no drill-down do HTML
-# (evita relatórios gigantes para hosts com milhares de ocorrências)
-MAX_EVENTS_PER_HOST = 300
+# Máximo de eventos exibidos POR CATEGORIA no drill-down do HTML (em vez de
+# um corte único por host). Evita tanto relatórios gigantes quanto o caso de
+# uma categoria muito frequente (ex.: 2.000 eventos de GPU) afogar as demais
+# — cada categoria identificada garante sua cota de exemplos mais recentes.
+MAX_EVENTS_PER_CATEGORY = 10
 
 # Marca o início de cada sub-evento dentro de "Detalhes" (ex.: "[2026-08-07 10:41:01]")
 RE_EVENT_MARKER = re.compile(r"(\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\])")
@@ -346,53 +348,91 @@ def render_markdown_report(report_data: dict, top_n: int = 15):
     md.append("")
     return "\n".join(md)
 
+def select_sample_events(events: list) -> tuple:
+    """
+    Escolhe quais eventos (já filtrados só os que bateram alguma regra)
+    entram no drill-down: até MAX_EVENTS_PER_CATEGORY exemplos mais
+    recentes de CADA categoria identificada, em vez de um corte único por
+    host — assim uma categoria muito frequente não afoga as demais.
+    Um evento com mais de uma categoria conta cota em todas elas.
+    Retorna (eventos_selecionados, quantidade_omitida).
+    """
+    per_category_count = Counter()
+    shown = []
+    for e in events:
+        if not any(per_category_count[c] < MAX_EVENTS_PER_CATEGORY for c in e["cats"]):
+            continue
+        for c in e["cats"]:
+            per_category_count[c] += 1
+        shown.append(e)
+
+    return shown, len(events) - len(shown)
+
 def render_host_detail_table(host: str, host_events: dict):
     """
-    Monta a sub-tabela HTML com todos os eventos de um host (usada no
-    drill-down ao clicar na linha do host no TOP N). Os eventos são
-    ordenados do mais recente para o mais antigo e limitados a
-    MAX_EVENTS_PER_HOST para não estourar o tamanho do arquivo.
+    Monta a sub-tabela HTML com o histórico de um host (usada no
+    drill-down ao clicar na linha do host no TOP N). Eventos que não
+    bateram nenhuma regra de categorização ("sem correspondência") são
+    ignorados aqui — só interessa dar exemplo do que foi identificado.
     """
     events = sorted(host_events.get(host, []), key=lambda e: e["dt"], reverse=True)
-    shown = events[:MAX_EVENTS_PER_HOST]
+    matched_events = [e for e in events if e["cats"]]
+    shown, omitted_matched = select_sample_events(matched_events)
+    ignored_no_match = len(events) - len(matched_events)
 
     rows_html = []
     for e in shown:
-        if e["cats"]:
-            ordered_cats = sorted(e["cats"], key=lambda c: CATEGORIES.index(c))
-            cats_html = "".join(
-                f"<span class='badge badge-match'>{html.escape(CATEGORY_LABELS[c])}</span>" for c in ordered_cats
-            )
-        else:
-            cats_html = "<span class='badge badge-none'>sem correspondência</span>"
+        ordered_cats = sorted(e["cats"], key=lambda c: CATEGORIES.index(c))
+        cats_text = ", ".join(CATEGORY_LABELS[c] for c in ordered_cats)
+        cats_html = "".join(
+            f"<span class='badge badge-match'>{html.escape(CATEGORY_LABELS[c])}</span>" for c in ordered_cats
+        )
         rows_html.append(
             "<tr>"
             f"<td class='mono'>{html.escape(e['date'])}</td>"
             f"<td>{html.escape(e['status'])}</td>"
-            f"<td>{cats_html}</td>"
-            f"<td class='detail-cell'>{html.escape(e['detail'])}</td>"
+            f"<td class='searchable' data-search='{html.escape(cats_text.lower())}'>{cats_html}</td>"
+            f"<td class='detail-cell searchable'>{html.escape(e['detail'])}</td>"
             "</tr>"
         )
 
-    note = ""
-    if len(events) > MAX_EVENTS_PER_HOST:
-        note = (
-            f"<p class='note-small'>Mostrando {MAX_EVENTS_PER_HOST} de {len(events)} "
-            "eventos (mais recentes primeiro).</p>"
+    if not events:
+        return "<p class='note-small'>Nenhum evento no período.</p>"
+
+    if not matched_events:
+        return (
+            f"<p class='note-small'>Nenhum dos {len(events)} eventos deste host "
+            "correspondeu a uma regra de categorização.</p>"
         )
 
-    if not rows_html:
-        body = "<p class='note-small'>Nenhum evento no período.</p>"
-    else:
-        body = (
-            "<div class='detail-scroll'>"
-            "<table class='detail-table'>"
-            "<thead><tr><th>Data</th><th>Status</th><th>Categorias</th><th>Detalhes</th></tr></thead>"
-            f"<tbody>{''.join(rows_html)}</tbody>"
-            "</table>"
-            "</div>"
-            f"{note}"
-        )
+    note_parts = [
+        f"Exemplos por categoria (até {MAX_EVENTS_PER_CATEGORY} mais recentes de cada) — "
+        f"{len(matched_events)} evento(s) com correspondência de regra"
+    ]
+    if omitted_matched > 0:
+        note_parts.append(f"{omitted_matched} não exibido(s) por já terem exemplo suficiente")
+    if ignored_no_match > 0:
+        note_parts.append(f"{ignored_no_match} sem correspondência de regra foram ignorados")
+    note = f"<p class='note-small'>{'; '.join(note_parts)}.</p>"
+
+    search = (
+        "<div class='detail-search'>"
+        "<input type='text' placeholder='Buscar por categoria ou detalhes...' "
+        "oninput=\"filterDetailRows(this)\" autocomplete='off'/>"
+        "<span class='detail-search-count'></span>"
+        "</div>"
+    )
+
+    body = (
+        f"{search}"
+        "<div class='detail-scroll'>"
+        "<table class='detail-table'>"
+        "<thead><tr><th>Data</th><th>Status</th><th>Categorias</th><th>Detalhes</th></tr></thead>"
+        f"<tbody>{''.join(rows_html)}</tbody>"
+        "</table>"
+        "</div>"
+        f"{note}"
+    )
     return body
 
 def render_top_hosts_table_html(agg: dict, top_n: int, id_prefix: str):
@@ -572,6 +612,12 @@ def render_html_report(report_data: dict, top_n: int = 15):
   table.detail-table th {{ position: sticky; top: 0; }}
   td.detail-cell {{ white-space: pre-wrap; word-break: break-word; }}
 
+  .detail-search {{ display: flex; align-items: center; gap: 8px; margin: 0 0 8px 0; }}
+  .detail-search input[type="text"] {{
+    flex: 0 1 280px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; font-size: 0.88em;
+  }}
+  .detail-search-count {{ color: #666; font-size: 0.8em; }}
+
   .col-config-panel {{
     background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 14px 16px;
     margin: 8px 0 16px 0; max-width: 420px;
@@ -622,6 +668,27 @@ def render_html_report(report_data: dict, top_n: int = 15):
     var COL_CONFIG_STORAGE_KEY = 'hpcReportColumns';
     var currentOrder = ALL_CATEGORIES.map(function(c) {{ return c.key; }});
     var currentChecked = {{}};
+
+    function filterDetailRows(inputEl) {{
+      var term = inputEl.value.trim().toLowerCase();
+      var wrap = inputEl.closest('.detail-wrap');
+      if (!wrap) return;
+      var rows = wrap.querySelectorAll('table.detail-table tbody tr');
+      var visible = 0;
+
+      rows.forEach(function(row) {{
+        var text = '';
+        row.querySelectorAll('.searchable').forEach(function(cell) {{
+          text += ' ' + (cell.getAttribute('data-search') || cell.textContent);
+        }});
+        var match = !term || text.toLowerCase().indexOf(term) !== -1;
+        row.style.display = match ? '' : 'none';
+        if (match) visible++;
+      }});
+
+      var counter = wrap.querySelector('.detail-search-count');
+      if (counter) counter.textContent = term ? (visible + ' de ' + rows.length) : '';
+    }}
 
     function toggleDetail(rowId, chevronId) {{
       var row = document.getElementById(rowId);
