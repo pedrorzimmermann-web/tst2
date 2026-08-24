@@ -467,15 +467,22 @@ def render_host_detail_table(host: str, host_events: dict):
     )
     return body
 
-def render_top_hosts_table_html(agg: dict, top_n: int, id_prefix: str):
+def render_top_hosts_table_html(agg: dict, id_prefix: str):
     """
-    Tabela "Top hosts" com drill-down clicável. id_prefix garante ids únicos
-    quando essa tabela é renderizada várias vezes (uma por cluster). As
-    colunas de categoria levam data-cat="<categoria>" e a tabela leva a
-    classe "cfg-table" — é o que o seletor "Configurar colunas" do HTML
-    usa para mostrar/ocultar/reordenar colunas.
+    Tabela de hosts com drill-down clicável. Lista TODOS os hosts (sem
+    cortar em top_n) — a ordenação por prioridade fixa (GPU > GPU Temp >
+    Sensor Temp > IB) só decide a ordem inicial das linhas, não quais
+    hosts aparecem: um host dominante só numa categoria menos prioritária
+    (ex.: GPU Temp) não pode ficar de fora só porque muitos outros hosts
+    têm 1 evento de uma categoria de prioridade maior. A busca e a
+    ordenação clicável por coluna é que ajudam a navegar em listas
+    grandes. id_prefix garante ids únicos quando essa tabela é renderizada
+    várias vezes (uma por cluster). As colunas de categoria levam
+    data-cat="<categoria>" e a tabela leva a classe "cfg-table" — é o que
+    o seletor "Configurar colunas" do HTML usa para mostrar/ocultar/
+    reordenar colunas.
     """
-    hosts = agg["hosts_sorted"][:top_n]
+    hosts = agg["hosts_sorted"]
     max_total = max([agg["per_host_total"][h] for h in hosts], default=1)
 
     def bar(v):
@@ -535,7 +542,7 @@ def _safe_json_for_script(data) -> str:
     """json.dumps, protegido contra a sequência "</script" quebrar a tag."""
     return json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
 
-def render_html_report(report_data: dict, top_n: int = 15):
+def render_html_report(report_data: dict):
     if report_data["multi_cluster"]:
         clusters_sorted = report_data["clusters_sorted"]
         cluster_aggs = report_data["cluster_aggs"]
@@ -567,7 +574,7 @@ def render_html_report(report_data: dict, top_n: int = 15):
             sections.append(
                 f"<div class='cluster-section' id='{anchor}' data-cluster-section>"
                 f"<h2>Cluster: {html.escape(c)}</h2>"
-                + render_top_hosts_table_html(cluster_aggs[c], top_n, id_prefix=f"c{idx}")
+                + render_top_hosts_table_html(cluster_aggs[c], id_prefix=f"c{idx}")
                 + "</div>"
             )
 
@@ -593,8 +600,8 @@ def render_html_report(report_data: dict, top_n: int = 15):
     else:
         body_main = f"""
   <div class="cluster-section" data-cluster-section>
-  <h2>Top hosts (consolidado)</h2>
-  {render_top_hosts_table_html(report_data["global_agg"], top_n, id_prefix="g")}
+  <h2>Hosts (consolidado)</h2>
+  {render_top_hosts_table_html(report_data["global_agg"], id_prefix="g")}
   </div>
 """
 
@@ -692,7 +699,7 @@ def render_html_report(report_data: dict, top_n: int = 15):
 </head>
 <body>
   <h1>Relatório – Reincidência de eventos críticos (Monit)</h1>
-  <div class="sub">Ranking consolidado e evidências (Top {top_n}) — clique em um host para ver todos os eventos</div>
+  <div class="sub">Todos os hosts, ordenados por prioridade — clique num cabeçalho de coluna para reordenar, ou num host para ver seu histórico</div>
 
   <div class="note">
     <b>Orientação operacional:</b> priorizar abertura de registros individuais para hosts com maior reincidência (categorias no topo da lista de regras).
@@ -988,14 +995,80 @@ def render_html_report(report_data: dict, top_n: int = 15):
 </html>"""
     return html_out
 
+def render_audit_report(rows: list, days_window: int, hostname: str) -> str:
+    """
+    Relatório de conferência para UM host: lista, categoria a categoria,
+    TODAS as linhas de "Detalhes" originais do CSV que bateram cada regra
+    e as que não bateram nenhuma — sem nenhum corte de amostragem (ao
+    contrário do drill-down do HTML, que limita a MAX_EVENTS_PER_CATEGORY
+    exemplos). Serve para confrontar a contagem do script linha a linha
+    com uma ferramenta externa (grep, outra regex, etc.) e achar
+    exatamente onde duas regras concorrentes divergem.
+    """
+    now = datetime.now()
+    start = now - timedelta(days=days_window)
+
+    host_rows = []
+    for r in rows:
+        if r["Hostname"] != hostname:
+            continue
+        dt = parse_dt(r["Date"])
+        if dt is None or dt < start or dt > now:
+            continue
+        host_rows.append((dt, r))
+    host_rows.sort(key=lambda item: item[0])
+
+    per_category = {c: [] for c in CATEGORIES}
+    no_match = []
+    for dt, r in host_rows:
+        cats = categorize(r["Detalhes"])
+        raw = re.sub(r"\s+", " ", (r["Detalhes"] or "").replace("\r", " ").replace("\n", " ")).strip()
+        if cats:
+            for c in cats:
+                per_category[c].append((r["Date"], raw))
+        else:
+            no_match.append((r["Date"], raw))
+
+    lines = []
+    lines.append(f"AUDITORIA — {hostname}")
+    lines.append(f"Janela analisada (últimos {days_window} dias): {start:%Y-%m-%d %H:%M:%S} até {now:%Y-%m-%d %H:%M:%S}")
+    lines.append(f"Total de linhas do host no período (antes de categorizar): {len(host_rows)}")
+    lines.append("")
+
+    for c in CATEGORIES:
+        items = per_category[c]
+        lines.append(f"=== {CATEGORY_LABELS[c]} — {len(items)} linha(s) ===")
+        for date_s, raw in items:
+            lines.append(f"{date_s} | {raw}")
+        lines.append("")
+
+    lines.append(f"=== SEM CORRESPONDÊNCIA (nenhuma regra bateu) — {len(no_match)} linha(s) ===")
+    for date_s, raw in no_match:
+        lines.append(f"{date_s} | {raw}")
+
+    return "\n".join(lines)
+
 def main():
-    if len(sys.argv) < 2:
-        print("Uso: python3 hpc_event_report.py <arquivo.csv> [dias] [topN]")
+    args = sys.argv[1:]
+
+    audit_host = None
+    if "--audit" in args:
+        idx = args.index("--audit")
+        if idx + 1 >= len(args):
+            print("Uso: --audit <hostname>")
+            sys.exit(1)
+        audit_host = args[idx + 1]
+        del args[idx:idx + 2]
+
+    if len(args) < 1:
+        print("Uso: python3 hpc_event_report.py <arquivo.csv> [dias] [topN] [--audit <hostname>]")
+        print("  --audit <hostname>  gera audit_<hostname>.txt com TODAS as linhas do host,")
+        print("                      sem corte de amostragem, para conferir contagem manualmente.")
         sys.exit(1)
 
-    csv_path = sys.argv[1]
-    days = int(sys.argv[2]) if len(sys.argv) >= 3 else 60
-    topn = int(sys.argv[3]) if len(sys.argv) >= 4 else 15
+    csv_path = args[0]
+    days = int(args[1]) if len(args) >= 2 else 60
+    topn = int(args[2]) if len(args) >= 3 else 15
 
     rows = read_monit_csv(csv_path)
     report_data = generate_reports(rows, days_window=days, top_n=topn)
@@ -1006,12 +1079,17 @@ def main():
 
     # Relatórios amigáveis
     md_report = render_markdown_report(report_data, top_n=topn)
-    html_report = render_html_report(report_data, top_n=topn)
+    html_report = render_html_report(report_data)
 
     write_text("report.md", md_report)
     write_text("report.html", html_report)
 
     print("OK: gerados report_summary.csv, report_top.txt, report.md e report.html")
+
+    if audit_host:
+        audit_path = f"audit_{audit_host}.txt"
+        write_text(audit_path, render_audit_report(rows, days, audit_host))
+        print(f"OK: gerado {audit_path}")
 
 if __name__ == "__main__":
     main()
