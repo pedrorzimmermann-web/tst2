@@ -63,6 +63,38 @@ def humanize_detail(detail: str) -> str:
 
     return "\n".join(lines)
 
+# Nível de severidade identificado dentro de cada linha do histórico (o
+# marcador "[ CRITICAL ]", "[ WARNING ]" etc. que o Monit imprime logo
+# após o timestamp). Usado só para colorir a linha no drill-down do HTML —
+# não tem relação com as categorias de rules.py. Ordem importa: a primeira
+# regra que bater define a cor da linha.
+LOG_LEVEL_RULES = [
+    ("recovery-fail", re.compile(r"\[\s*RECOVERY\s*FAIL(?:ED)?\s*\]", re.IGNORECASE)),
+    ("critical", re.compile(r"\[\s*CRITICAL\s*\]", re.IGNORECASE)),
+    ("warning", re.compile(r"\[\s*WARNING\s*\]", re.IGNORECASE)),
+]
+
+def classify_log_level(line: str):
+    for level, rx in LOG_LEVEL_RULES:
+        if rx.search(line):
+            return level
+    return None
+
+def render_detail_html(detail: str) -> str:
+    """
+    Renderiza o texto de "Detalhes" (já com uma linha por sub-evento, via
+    humanize_detail) como HTML, colorindo cada linha inteira conforme o
+    nível de severidade encontrado nela (ver LOG_LEVEL_RULES). Preserva as
+    quebras de linha reais para o CSS "white-space: pre-wrap" do
+    .detail-cell continuar funcionando.
+    """
+    spans = []
+    for line in detail.split("\n"):
+        level = classify_log_level(line)
+        css_class = f"log-line log-{level}" if level else "log-line"
+        spans.append(f"<span class='{css_class}'>{html.escape(line)}</span>")
+    return "\n".join(spans)
+
 def parse_dt(s: str):
     # formato do CSV: "2026-08-17 09:41:34"
     try:
@@ -392,7 +424,7 @@ def render_host_detail_table(host: str, host_events: dict):
             f"<td class='mono'>{html.escape(e['date'])}</td>"
             f"<td>{html.escape(e['status'])}</td>"
             f"<td class='searchable' data-search='{html.escape(cats_text.lower())}'>{cats_html}</td>"
-            f"<td class='detail-cell searchable'>{html.escape(e['detail'])}</td>"
+            f"<td class='detail-cell searchable'>{render_detail_html(e['detail'])}</td>"
             "</tr>"
         )
 
@@ -450,7 +482,9 @@ def render_top_hosts_table_html(agg: dict, top_n: int, id_prefix: str):
         pct = int((v / max_total) * 100) if max_total else 0
         return f'<div class="bar"><div class="fill" style="width:{pct}%"></div></div>'
 
-    header_cats = "".join(f"<th data-cat='{c}'>{html.escape(CATEGORY_LABELS[c])}</th>" for c in CATEGORIES)
+    header_cats = "".join(
+        f"<th data-cat='{c}' data-sort-type='num'>{html.escape(CATEGORY_LABELS[c])}</th>" for c in CATEGORIES
+    )
 
     table_rows = []
     for i, h in enumerate(hosts):
@@ -487,7 +521,11 @@ def render_top_hosts_table_html(agg: dict, top_n: int, id_prefix: str):
     return (
         "<table class='cfg-table'>"
         "<thead><tr>"
-        f"<th>Hostname</th><th>Correspondência</th><th>Total</th><th>Visual</th>{header_cats}"
+        "<th data-sort-type='text-natural'>Hostname</th>"
+        "<th data-sort-type='text'>Correspondência</th>"
+        "<th data-sort-type='num'>Total</th>"
+        "<th>Visual</th>"
+        f"{header_cats}"
         "</tr></thead>"
         f"<tbody>{''.join(table_rows)}</tbody>"
         "</table>"
@@ -502,7 +540,9 @@ def render_html_report(report_data: dict, top_n: int = 15):
         clusters_sorted = report_data["clusters_sorted"]
         cluster_aggs = report_data["cluster_aggs"]
 
-        index_header_cats = "".join(f"<th data-cat='{c}'>{html.escape(CATEGORY_LABELS[c])}</th>" for c in CATEGORIES)
+        index_header_cats = "".join(
+            f"<th data-cat='{c}' data-sort-type='num'>{html.escape(CATEGORY_LABELS[c])}</th>" for c in CATEGORIES
+        )
 
         index_rows = []
         sections = []
@@ -536,7 +576,11 @@ def render_html_report(report_data: dict, top_n: int = 15):
   <table class="cfg-table">
     <thead>
       <tr>
-        <th>Cluster</th><th>Correspondência</th><th>Hosts afetados</th><th>Total</th>{index_header_cats}
+        <th data-sort-type="text-natural">Cluster</th>
+        <th data-sort-type="text">Correspondência</th>
+        <th data-sort-type="num">Hosts afetados</th>
+        <th data-sort-type="num">Total</th>
+        {index_header_cats}
       </tr>
     </thead>
     <tbody>
@@ -598,6 +642,12 @@ def render_html_report(report_data: dict, top_n: int = 15):
   .badge-match {{ background: #e6f7ec; color: #0b7a3b; }}
   .badge-none {{ background: #eef1f5; color: #5b6b7c; }}
 
+  th[data-sort-type] {{ cursor: pointer; user-select: none; white-space: nowrap; }}
+  th[data-sort-type]:hover {{ background: #eef1f5; }}
+  th[data-sort-type]::after {{ content: '\\2195'; margin-left: 5px; opacity: 0.3; font-size: 0.85em; }}
+  th[data-sort-type][data-sort-dir="asc"]::after {{ content: '\\25B2'; opacity: 1; }}
+  th[data-sort-type][data-sort-dir="desc"]::after {{ content: '\\25BC'; opacity: 1; }}
+
   tr.host-row {{ cursor: pointer; }}
   tr.host-row:hover {{ background: #f0f7ff; }}
   .chevron {{ display: inline-block; transition: transform .15s ease; }}
@@ -611,6 +661,10 @@ def render_html_report(report_data: dict, top_n: int = 15):
   table.detail-table {{ width: 100%; margin-top: 0; font-size: 0.9em; }}
   table.detail-table th {{ position: sticky; top: 0; }}
   td.detail-cell {{ white-space: pre-wrap; word-break: break-word; }}
+  .log-line {{ padding: 0 2px; border-radius: 3px; }}
+  .log-line.log-warning {{ background: #fff3cd; color: #7a5b00; }}
+  .log-line.log-critical {{ background: #f8d7da; color: #d32f2f; font-weight: 700; }}
+  .log-line.log-recovery-fail {{ background: #f1b0b7; color: #7a1414; font-weight: 700; }}
 
   .detail-search {{ display: flex; align-items: center; gap: 8px; margin: 0 0 8px 0; }}
   .detail-search input[type="text"] {{
@@ -841,7 +895,94 @@ def render_html_report(report_data: dict, top_n: int = 15):
       applyColumnConfig(currentOrder.filter(function(k) {{ return currentChecked[k]; }}));
     }}
 
+    // Ordenação "natural": trata sequências de dígitos como número, não
+    // caractere a caractere — assim hostb01n01, hostb01n02, ..., hostb01n32,
+    // hostb02n01 saem na ordem certa em vez de hostb01n1 < hostb01n10 < hostb01n2.
+    function naturalCompare(a, b) {{
+      var re = /(\d+)|(\D+)/g;
+      var ax = a.match(re) || [];
+      var bx = b.match(re) || [];
+      var len = Math.max(ax.length, bx.length);
+      for (var i = 0; i < len; i++) {{
+        var av = ax[i] || '';
+        var bv = bx[i] || '';
+        var an = /^\d+$/.test(av);
+        var bn = /^\d+$/.test(bv);
+        if (an && bn) {{
+          var diff = parseInt(av, 10) - parseInt(bv, 10);
+          if (diff !== 0) return diff;
+        }} else if (av !== bv) {{
+          return av < bv ? -1 : 1;
+        }}
+      }}
+      return 0;
+    }}
+
+    // Agrupa cada tr.host-row com sua tr.detail-row logo em seguida (se
+    // houver), para que ao reordenar o histórico expandido continue
+    // colado embaixo do host certo. Linhas do índice de clusters (sem
+    // detail-row associado) viram grupos de 1.
+    function getRowGroups(tbody) {{
+      var groups = [];
+      var rows = Array.prototype.slice.call(tbody.children);
+      for (var i = 0; i < rows.length; i++) {{
+        var row = rows[i];
+        if (row.classList.contains('detail-row')) continue;
+        var group = [row];
+        var next = rows[i + 1];
+        if (next && next.classList.contains('detail-row')) group.push(next);
+        groups.push(group);
+      }}
+      return groups;
+    }}
+
+    function sortTable(table, colIndex, sortType, dir) {{
+      var tbody = table.querySelector('tbody');
+      if (!tbody) return;
+      var groups = getRowGroups(tbody);
+
+      groups.sort(function(ga, gb) {{
+        var ca = ga[0].children[colIndex];
+        var cb = gb[0].children[colIndex];
+        var va = (ca ? ca.textContent : '').trim();
+        var vb = (cb ? cb.textContent : '').trim();
+        var cmp;
+        if (sortType === 'num') {{
+          cmp = (parseFloat(va) || 0) - (parseFloat(vb) || 0);
+        }} else if (sortType === 'text-natural') {{
+          cmp = naturalCompare(va.toLowerCase(), vb.toLowerCase());
+        }} else {{
+          cmp = va.toLowerCase() < vb.toLowerCase() ? -1 : (va.toLowerCase() > vb.toLowerCase() ? 1 : 0);
+        }}
+        return dir === 'asc' ? cmp : -cmp;
+      }});
+
+      groups.forEach(function(g) {{
+        g.forEach(function(row) {{ tbody.appendChild(row); }});
+      }});
+    }}
+
+    function initSortableTables() {{
+      document.querySelectorAll('table.cfg-table thead th[data-sort-type]').forEach(function(th) {{
+        th.addEventListener('click', function() {{
+          var table = th.closest('table');
+          var headerRow = th.parentNode;
+          var colIndex = Array.prototype.indexOf.call(headerRow.children, th);
+          var sortType = th.getAttribute('data-sort-type');
+          var newDir = th.getAttribute('data-sort-dir') === 'asc' ? 'desc' : 'asc';
+
+          headerRow.querySelectorAll('th[data-sort-type]').forEach(function(other) {{
+            if (other !== th) other.removeAttribute('data-sort-dir');
+          }});
+          th.setAttribute('data-sort-dir', newDir);
+
+          sortTable(table, colIndex, sortType, newDir);
+        }});
+      }});
+    }}
+
     initColConfig();
+    initSortableTables();
   </script>
 </body>
 </html>"""
