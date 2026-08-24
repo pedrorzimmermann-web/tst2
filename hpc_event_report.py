@@ -3,28 +3,36 @@
 
 import csv
 import html
+import json
 import re
 import sys
 from datetime import datetime, timedelta
 from collections import defaultdict, Counter
 
+from rules import RULES
+
 # -----------------------------
 # Config
 # -----------------------------
-CATEGORIES = ["gpu_temp", "sensor_temp", "gpu", "ib"]
+# CATEGORIES/CATEGORY_LABELS vêm de rules.py — para adicionar ou ajustar
+# uma regra de categorização, edite aquele arquivo (ele tem um "README"
+# comentado explicando como). A ordem de RULES define tanto a prioridade
+# de ranking quanto a ordem padrão das colunas nos relatórios.
+CATEGORIES = [r["category"] for r in RULES]
+CATEGORY_LABELS = {r["category"]: r["label"] for r in RULES}
+_COMPILED_RULES = [
+    {**r, "regex": re.compile(r["pattern"], re.IGNORECASE)} for r in RULES
+]
+
+# Colunas fixas (não configuráveis) que sempre precedem as de categoria
+# nas tabelas do HTML + margem de segurança para o colspan das linhas
+# de drill-down.
+FIXED_COLUMNS_HTML = 4
+DETAIL_COLSPAN = FIXED_COLUMNS_HTML + len(CATEGORIES) + 4
 
 # Máximo de eventos individuais exibidos por host no drill-down do HTML
 # (evita relatórios gigantes para hosts com milhares de ocorrências)
 MAX_EVENTS_PER_HOST = 300
-
-# Regras (ajuste fino se necessário)
-RE_IB = re.compile(r"\bIB\b|INFINIBAND|\bib0\b|\bib1\b|IB\s*-", re.IGNORECASE)
-RE_GPU_TEMP = re.compile(r"GPU\s*-\s*TEMPERATURA|\[TST23-07\]", re.IGNORECASE)
-RE_SENSOR_TEMP = re.compile(r"TEMPERATURA|\[TST13-01\]", re.IGNORECASE)
-RE_GPU = re.compile(
-    r"GPU\s*-\s*NVIDIA|NVRM|NVLINK|\[TST23-02\]|\[TST23-04\]|\[TST23-05\]|\[TST23-08\]|\[TST23-10\]",
-    re.IGNORECASE
-)
 
 # Marca o início de cada sub-evento dentro de "Detalhes" (ex.: "[2026-08-07 10:41:01]")
 RE_EVENT_MARKER = re.compile(r"(\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\])")
@@ -62,21 +70,19 @@ def parse_dt(s: str):
 
 def categorize(details: str):
     """
-    Pode retornar múltiplas categorias (ex.: GPU + IB no mesmo evento).
-    Isso é útil para reincidência por tipo.
+    Aplica as regras de rules.py na ordem definida lá. Pode retornar
+    múltiplas categorias (ex.: GPU + IB no mesmo evento) — útil para
+    reincidência por tipo. "exclude_if_matched" permite que uma regra
+    seja pulada se outra categoria já tiver batido no mesmo evento.
     """
     d = details or ""
     cats = set()
 
-    if RE_IB.search(d):
-        cats.add("ib")
-    if RE_GPU_TEMP.search(d):
-        cats.add("gpu_temp")
-    # sensor_temp: temperatura genérica, excluindo os casos já marcados como gpu_temp
-    if RE_SENSOR_TEMP.search(d) and ("gpu_temp" not in cats):
-        cats.add("sensor_temp")
-    if RE_GPU.search(d):
-        cats.add("gpu")
+    for rule in _COMPILED_RULES:
+        if any(dep in cats for dep in rule.get("exclude_if_matched", ())):
+            continue
+        if rule["regex"].search(d):
+            cats.add(rule["category"])
 
     return cats
 
@@ -141,26 +147,16 @@ def aggregate_events(rows, top_n: int):
             "detail": humanize_detail(r["Detalhes"]),
         })
 
-    # Ordenação: prioriza GPU, depois GPU temp, depois sensor temp, IB, total
+    # Ordenação: segue a prioridade definida pela ordem de CATEGORIES
+    # (rules.py), com o total de eventos como critério de desempate final.
     def sort_key(h):
-        return (
-            per_host_cat["gpu"][h],
-            per_host_cat["gpu_temp"][h],
-            per_host_cat["sensor_temp"][h],
-            per_host_cat["ib"][h],
-            per_host_total[h]
-        )
+        return tuple(per_host_cat[c][h] for c in CATEGORIES) + (per_host_total[h],)
 
     hosts_sorted = sorted(per_host_total.keys(), key=sort_key, reverse=True)
 
-    totals = {
-        "hosts_afetados": len(hosts_sorted),
-        "total_events": sum(per_host_total.values()),
-        "gpu": sum(per_host_cat["gpu"].values()),
-        "gpu_temp": sum(per_host_cat["gpu_temp"].values()),
-        "sensor_temp": sum(per_host_cat["sensor_temp"].values()),
-        "ib": sum(per_host_cat["ib"].values()),
-    }
+    totals = {"hosts_afetados": len(hosts_sorted), "total_events": sum(per_host_total.values())}
+    for c in CATEGORIES:
+        totals[c] = sum(per_host_cat[c].values())
 
     return {
         "hosts_sorted": hosts_sorted,
@@ -177,18 +173,15 @@ def render_scope_report_text(agg, top_n: int, title: str = None):
     if title:
         lines.append(title)
     lines.append(f"TOP {top_n} hosts (consolidado):")
-    lines.append("Hostname | total | gpu | gpu_temp | sensor_temp | ib")
+    lines.append("Hostname | total | " + " | ".join(CATEGORIES))
     for h in agg["hosts_sorted"][:top_n]:
-        lines.append(
-            f"{h} | {agg['per_host_total'][h]} | {agg['per_host_cat']['gpu'][h]} | "
-            f"{agg['per_host_cat']['gpu_temp'][h]} | {agg['per_host_cat']['sensor_temp'][h]} | "
-            f"{agg['per_host_cat']['ib'][h]}"
-        )
+        cat_values = " | ".join(str(agg["per_host_cat"][c][h]) for c in CATEGORIES)
+        lines.append(f"{h} | {agg['per_host_total'][h]} | {cat_values}")
 
     lines.append("")
     lines.append("TOP por categoria:")
     for c in CATEGORIES:
-        lines.append(f"- {c}:")
+        lines.append(f"- {CATEGORY_LABELS[c]}:")
         top = agg["per_host_cat"][c].most_common(top_n)
         if not top:
             lines.append("  (sem ocorrências)")
@@ -201,7 +194,7 @@ def render_scope_report_text(agg, top_n: int, title: str = None):
     for h in agg["hosts_sorted"][:top_n]:
         for c in CATEGORIES:
             if agg["per_host_cat"][c][h] > 0:
-                lines.append(f"* {h} / {c} ({agg['per_host_cat'][c][h]} ocorrências):")
+                lines.append(f"* {h} / {CATEGORY_LABELS[c]} ({agg['per_host_cat'][c][h]} ocorrências):")
                 for s in agg["samples"][h][c]:
                     lines.append(f"  - {s}")
 
@@ -245,11 +238,11 @@ def generate_reports(rows, days_window: int, top_n: int = 15):
         global_agg = aggregate_events(filtered, top_n)
         report.extend(render_scope_report_text(global_agg, top_n))
 
-        summary_lines = [["Hostname", "total_events", "gpu", "gpu_temp", "sensor_temp", "ib"]]
+        summary_lines = [["Hostname", "total_events"] + CATEGORIES]
         for h in global_agg["hosts_sorted"]:
             t = global_agg["per_host_total"]
             c = global_agg["per_host_cat"]
-            summary_lines.append([h, str(t[h]), str(c["gpu"][h]), str(c["gpu_temp"][h]), str(c["sensor_temp"][h]), str(c["ib"][h])])
+            summary_lines.append([h, str(t[h])] + [str(c[cat][h]) for cat in CATEGORIES])
     else:
         cluster_rows = defaultdict(list)
         for r in filtered:
@@ -258,18 +251,16 @@ def generate_reports(rows, days_window: int, top_n: int = 15):
 
         def cluster_sort_key(c):
             t = cluster_aggs[c]["totals"]
-            return (t["gpu"], t["gpu_temp"], t["sensor_temp"], t["ib"], t["total_events"])
+            return tuple(t[cat] for cat in CATEGORIES) + (t["total_events"],)
 
         clusters_sorted = sorted(clusters, key=cluster_sort_key, reverse=True)
 
         report.append(f"ÍNDICE DE CLUSTERS ({len(clusters_sorted)}):")
-        report.append("Cluster | hosts_afetados | total | gpu | gpu_temp | sensor_temp | ib")
+        report.append("Cluster | hosts_afetados | total | " + " | ".join(CATEGORIES))
         for c in clusters_sorted:
             t = cluster_aggs[c]["totals"]
-            report.append(
-                f"{c} | {t['hosts_afetados']} | {t['total_events']} | {t['gpu']} | {t['gpu_temp']} | "
-                f"{t['sensor_temp']} | {t['ib']}"
-            )
+            cat_values = " | ".join(str(t[cat]) for cat in CATEGORIES)
+            report.append(f"{c} | {t['hosts_afetados']} | {t['total_events']} | {cat_values}")
         report.append("")
 
         for c in clusters_sorted:
@@ -279,17 +270,17 @@ def generate_reports(rows, days_window: int, top_n: int = 15):
             report.extend(render_scope_report_text(cluster_aggs[c], top_n))
             report.append("")
 
-        summary_lines = [["Cluster", "Hostname", "total_events", "gpu", "gpu_temp", "sensor_temp", "ib"]]
+        summary_lines = [["Cluster", "Hostname", "total_events"] + CATEGORIES]
         for c in clusters_sorted:
             agg = cluster_aggs[c]
             t = agg["per_host_total"]
             pc = agg["per_host_cat"]
             for h in agg["hosts_sorted"]:
-                summary_lines.append([c, h, str(t[h]), str(pc["gpu"][h]), str(pc["gpu_temp"][h]), str(pc["sensor_temp"][h]), str(pc["ib"][h])])
+                summary_lines.append([c, h, str(t[h])] + [str(pc[cat][h]) for cat in CATEGORIES])
 
     report.append("")
     report.append("Recomendação operacional:")
-    report.append("- Abrir registros individuais para os hosts com reincidência muito acima dos demais, priorizando GPU e IB.")
+    report.append("- Abrir registros individuais para os hosts com reincidência muito acima dos demais, priorizando as categorias no topo da lista de regras.")
     report.append("- Tratar aos poucos (1 host por vez) junto ao fornecedor, anexando este relatório e os logs do host quando necessário.")
 
     return {
@@ -312,12 +303,13 @@ def write_text(path, content: str):
 
 def render_markdown_scope_table(agg, top_n: int):
     lines = []
-    lines.append("| Hostname | Total | GPU | GPU Temp | Sensor Temp | IB |")
-    lines.append("|---|---:|---:|---:|---:|---:|")
+    lines.append("| Hostname | Total | " + " | ".join(CATEGORY_LABELS[c] for c in CATEGORIES) + " |")
+    lines.append("|---|---:|" + "---:|" * len(CATEGORIES))
     for h in agg["hosts_sorted"][:top_n]:
         t = agg["per_host_total"]
         c = agg["per_host_cat"]
-        lines.append(f"| {h} | {t[h]} | {c['gpu'][h]} | {c['gpu_temp'][h]} | {c['sensor_temp'][h]} | {c['ib'][h]} |")
+        cat_values = " | ".join(str(c[cat][h]) for cat in CATEGORIES)
+        lines.append(f"| {h} | {t[h]} | {cat_values} |")
     return lines
 
 def render_markdown_report(report_data: dict, top_n: int = 15):
@@ -328,11 +320,12 @@ def render_markdown_report(report_data: dict, top_n: int = 15):
     if report_data["multi_cluster"]:
         md.append("## Índice de clusters")
         md.append("")
-        md.append("| Cluster | Hosts afetados | Total | GPU | GPU Temp | Sensor Temp | IB |")
-        md.append("|---|---:|---:|---:|---:|---:|---:|")
+        md.append("| Cluster | Hosts afetados | Total | " + " | ".join(CATEGORY_LABELS[c] for c in CATEGORIES) + " |")
+        md.append("|---|---:|---:|" + "---:|" * len(CATEGORIES))
         for c in report_data["clusters_sorted"]:
             t = report_data["cluster_aggs"][c]["totals"]
-            md.append(f"| {c} | {t['hosts_afetados']} | {t['total_events']} | {t['gpu']} | {t['gpu_temp']} | {t['sensor_temp']} | {t['ib']} |")
+            cat_values = " | ".join(str(t[cat]) for cat in CATEGORIES)
+            md.append(f"| {c} | {t['hosts_afetados']} | {t['total_events']} | {cat_values} |")
         md.append("")
 
         for c in report_data["clusters_sorted"]:
@@ -366,8 +359,9 @@ def render_host_detail_table(host: str, host_events: dict):
     rows_html = []
     for e in shown:
         if e["cats"]:
+            ordered_cats = sorted(e["cats"], key=lambda c: CATEGORIES.index(c))
             cats_html = "".join(
-                f"<span class='badge badge-match'>{html.escape(c)}</span>" for c in sorted(e["cats"])
+                f"<span class='badge badge-match'>{html.escape(CATEGORY_LABELS[c])}</span>" for c in ordered_cats
             )
         else:
             cats_html = "<span class='badge badge-none'>sem correspondência</span>"
@@ -404,7 +398,10 @@ def render_host_detail_table(host: str, host_events: dict):
 def render_top_hosts_table_html(agg: dict, top_n: int, id_prefix: str):
     """
     Tabela "Top hosts" com drill-down clicável. id_prefix garante ids únicos
-    quando essa tabela é renderizada várias vezes (uma por cluster).
+    quando essa tabela é renderizada várias vezes (uma por cluster). As
+    colunas de categoria levam data-cat="<categoria>" e a tabela leva a
+    classe "cfg-table" — é o que o seletor "Configurar colunas" do HTML
+    usa para mostrar/ocultar/reordenar colunas.
     """
     hosts = agg["hosts_sorted"][:top_n]
     max_total = max([agg["per_host_total"][h] for h in hosts], default=1)
@@ -413,17 +410,20 @@ def render_top_hosts_table_html(agg: dict, top_n: int, id_prefix: str):
         pct = int((v / max_total) * 100) if max_total else 0
         return f'<div class="bar"><div class="fill" style="width:{pct}%"></div></div>'
 
+    header_cats = "".join(f"<th data-cat='{c}'>{html.escape(CATEGORY_LABELS[c])}</th>" for c in CATEGORIES)
+
     table_rows = []
     for i, h in enumerate(hosts):
         detail_id = f"{id_prefix}-detail-{i}"
         chevron_id = f"{id_prefix}-chevron-{i}"
         t = agg["per_host_total"]
         c = agg["per_host_cat"]
-        matched = (c["gpu"][h] + c["gpu_temp"][h] + c["sensor_temp"][h] + c["ib"][h]) > 0
+        matched = any(c[cat][h] > 0 for cat in CATEGORIES)
         match_badge = (
             "<span class='badge badge-match'>&#10003; regra identificada</span>" if matched
             else "<span class='badge badge-none'>sem correspondência</span>"
         )
+        row_cats = "".join(f"<td class='num' data-cat='{cat}'>{c[cat][h]}</td>" for cat in CATEGORIES)
         table_rows.append(
             "<tr class='host-row' "
             f"data-host='{html.escape(h)}' data-detail-id='{detail_id}' "
@@ -434,53 +434,54 @@ def render_top_hosts_table_html(agg: dict, top_n: int, id_prefix: str):
             f"<td>{match_badge}</td>"
             f"<td class='num'>{t[h]}</td>"
             f"<td>{bar(t[h])}</td>"
-            f"<td class='num'>{c['gpu'][h]}</td>"
-            f"<td class='num'>{c['gpu_temp'][h]}</td>"
-            f"<td class='num'>{c['sensor_temp'][h]}</td>"
-            f"<td class='num'>{c['ib'][h]}</td>"
+            f"{row_cats}"
             "</tr>"
         )
         table_rows.append(
             f"<tr class='detail-row' id='{detail_id}'>"
-            "<td colspan='8'>"
+            f"<td colspan='{DETAIL_COLSPAN}'>"
             f"<div class='detail-wrap'>{render_host_detail_table(h, agg['host_events'])}</div>"
             "</td></tr>"
         )
 
     return (
-        "<table>"
+        "<table class='cfg-table'>"
         "<thead><tr>"
-        "<th>Hostname</th><th>Correspondência</th><th>Total</th><th>Visual</th><th>GPU</th><th>GPU Temp</th><th>Sensor Temp</th><th>IB</th>"
+        f"<th>Hostname</th><th>Correspondência</th><th>Total</th><th>Visual</th>{header_cats}"
         "</tr></thead>"
         f"<tbody>{''.join(table_rows)}</tbody>"
         "</table>"
     )
+
+def _safe_json_for_script(data) -> str:
+    """json.dumps, protegido contra a sequência "</script" quebrar a tag."""
+    return json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
 
 def render_html_report(report_data: dict, top_n: int = 15):
     if report_data["multi_cluster"]:
         clusters_sorted = report_data["clusters_sorted"]
         cluster_aggs = report_data["cluster_aggs"]
 
+        index_header_cats = "".join(f"<th data-cat='{c}'>{html.escape(CATEGORY_LABELS[c])}</th>" for c in CATEGORIES)
+
         index_rows = []
         sections = []
         for idx, c in enumerate(clusters_sorted):
             t = cluster_aggs[c]["totals"]
             anchor = f"cluster-{idx}"
-            cluster_matched = (t["gpu"] + t["gpu_temp"] + t["sensor_temp"] + t["ib"]) > 0
+            cluster_matched = any(t[cat] > 0 for cat in CATEGORIES)
             match_badge = (
                 "<span class='badge badge-match'>&#10003; regra identificada</span>" if cluster_matched
                 else "<span class='badge badge-none'>sem correspondência</span>"
             )
+            index_row_cats = "".join(f"<td class='num' data-cat='{cat}'>{t[cat]}</td>" for cat in CATEGORIES)
             index_rows.append(
                 "<tr>"
                 f"<td class='mono'><a href='#{anchor}'>{html.escape(c)}</a></td>"
                 f"<td>{match_badge}</td>"
                 f"<td class='num'>{t['hosts_afetados']}</td>"
                 f"<td class='num'>{t['total_events']}</td>"
-                f"<td class='num'>{t['gpu']}</td>"
-                f"<td class='num'>{t['gpu_temp']}</td>"
-                f"<td class='num'>{t['sensor_temp']}</td>"
-                f"<td class='num'>{t['ib']}</td>"
+                f"{index_row_cats}"
                 "</tr>"
             )
             sections.append(
@@ -492,10 +493,10 @@ def render_html_report(report_data: dict, top_n: int = 15):
 
         body_main = f"""
   <h2>Índice de clusters</h2>
-  <table>
+  <table class="cfg-table">
     <thead>
       <tr>
-        <th>Cluster</th><th>Correspondência</th><th>Hosts afetados</th><th>Total</th><th>GPU</th><th>GPU Temp</th><th>Sensor Temp</th><th>IB</th>
+        <th>Cluster</th><th>Correspondência</th><th>Hosts afetados</th><th>Total</th>{index_header_cats}
       </tr>
     </thead>
     <tbody>
@@ -512,6 +513,10 @@ def render_html_report(report_data: dict, top_n: int = 15):
   {render_top_hosts_table_html(report_data["global_agg"], top_n, id_prefix="g")}
   </div>
 """
+
+    all_categories_json = _safe_json_for_script(
+        [{"key": c, "label": CATEGORY_LABELS[c]} for c in CATEGORIES]
+    )
 
     html_out = f"""<!doctype html>
 <html lang="pt-br">
@@ -534,16 +539,21 @@ def render_html_report(report_data: dict, top_n: int = 15):
   .note {{ background: #fff7e6; padding: 10px 12px; border: 1px solid #f1d28a; border-radius: 8px; }}
   .note-small {{ color: #666; font-size: 0.85em; margin: 6px 2px; }}
 
-  .toolbar {{ display: flex; align-items: center; gap: 10px; margin: 16px 0; }}
+  .toolbar {{ display: flex; align-items: center; gap: 10px; margin: 16px 0; flex-wrap: wrap; }}
   .toolbar input[type="text"] {{
     flex: 0 1 320px; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 0.95em;
   }}
   .toolbar input[type="text"]:focus {{ outline: 2px solid #8ab4f8; border-color: #8ab4f8; }}
   #searchCount {{ color: #666; font-size: 0.85em; }}
+  .toolbar button {{
+    padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px; background: #fff;
+    cursor: pointer; font-size: 0.9em;
+  }}
+  .toolbar button:hover {{ background: #f0f7ff; }}
 
   .badge {{
     display: inline-block; padding: 2px 9px; border-radius: 999px;
-    font-size: 0.82em; font-weight: 600; white-space: nowrap;
+    font-size: 0.82em; font-weight: 600; white-space: nowrap; margin: 1px 2px 1px 0;
   }}
   .badge-match {{ background: #e6f7ec; color: #0b7a3b; }}
   .badge-none {{ background: #eef1f5; color: #5b6b7c; }}
@@ -561,6 +571,23 @@ def render_html_report(report_data: dict, top_n: int = 15):
   table.detail-table {{ width: 100%; margin-top: 0; font-size: 0.9em; }}
   table.detail-table th {{ position: sticky; top: 0; }}
   td.detail-cell {{ white-space: pre-wrap; word-break: break-word; }}
+
+  .col-config-panel {{
+    background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 14px 16px;
+    margin: 8px 0 16px 0; max-width: 420px;
+  }}
+  .col-config-panel ul {{ list-style: none; margin: 10px 0; padding: 0; }}
+  .col-config-item {{
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 5px 4px; border-bottom: 1px solid #f0f0f0;
+  }}
+  .col-config-item label {{ display: flex; align-items: center; gap: 6px; cursor: pointer; }}
+  .col-config-arrows button {{
+    border: 1px solid #ccc; background: #fafafa; border-radius: 4px; cursor: pointer;
+    width: 26px; height: 24px; margin-left: 4px;
+  }}
+  .col-config-arrows button:hover {{ background: #eef1f5; }}
+  .col-config-actions {{ display: flex; gap: 8px; margin-top: 10px; }}
 </style>
 </head>
 <body>
@@ -568,18 +595,34 @@ def render_html_report(report_data: dict, top_n: int = 15):
   <div class="sub">Ranking consolidado e evidências (Top {top_n}) — clique em um host para ver todos os eventos</div>
 
   <div class="note">
-    <b>Orientação operacional:</b> priorizar abertura de registros individuais para hosts com maior reincidência (GPU/IB) e tratar aos poucos.
+    <b>Orientação operacional:</b> priorizar abertura de registros individuais para hosts com maior reincidência (categorias no topo da lista de regras).
   </div>
 
   <div class="toolbar">
     <input type="text" id="hostSearch" placeholder="Buscar host..." oninput="filterHosts(this.value)" autocomplete="off"/>
     <span id="searchCount"></span>
+    <button type="button" onclick="toggleColConfig()">Configurar colunas &#9881;</button>
   </div>
+
+  <div id="colConfigPanel" class="col-config-panel" style="display:none">
+    <p class="note-small">Marque quais categorias exibir como coluna nas tabelas e use as setas para reordenar. A escolha fica salva neste navegador.</p>
+    <ul id="colConfigList"></ul>
+    <div class="col-config-actions">
+      <button type="button" onclick="applyColConfigFromPanel()">Aplicar</button>
+      <button type="button" onclick="resetColConfig()">Restaurar padrão</button>
+    </div>
+  </div>
+
   {body_main}
   <h2>Detalhes e evidências (texto)</h2>
   <pre>{html.escape(report_data["report_txt"])}</pre>
 
   <script>
+    var ALL_CATEGORIES = {all_categories_json};
+    var COL_CONFIG_STORAGE_KEY = 'hpcReportColumns';
+    var currentOrder = ALL_CATEGORIES.map(function(c) {{ return c.key; }});
+    var currentChecked = {{}};
+
     function toggleDetail(rowId, chevronId) {{
       var row = document.getElementById(rowId);
       var chevron = document.getElementById(chevronId);
@@ -616,6 +659,122 @@ def render_html_report(report_data: dict, top_n: int = 15):
         section.style.display = (!term || anyVisible) ? '' : 'none';
       }});
     }}
+
+    function applyColumnConfig(selectedCats) {{
+      document.querySelectorAll('table.cfg-table').forEach(function(table) {{
+        table.querySelectorAll('tr').forEach(function(row) {{
+          row.querySelectorAll('[data-cat]').forEach(function(cell) {{ cell.style.display = 'none'; }});
+          selectedCats.forEach(function(cat) {{
+            var cell = row.querySelector('[data-cat="' + cat + '"]');
+            if (cell) {{
+              cell.style.display = '';
+              row.appendChild(cell);
+            }}
+          }});
+        }});
+      }});
+    }}
+
+    function renderColConfigList() {{
+      var list = document.getElementById('colConfigList');
+      list.innerHTML = '';
+      currentOrder.forEach(function(key, idx) {{
+        var meta = ALL_CATEGORIES.find(function(c) {{ return c.key === key; }});
+        var label = meta ? meta.label : key;
+
+        var checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = !!currentChecked[key];
+        checkbox.onchange = function() {{ currentChecked[key] = checkbox.checked; }};
+
+        var labelEl = document.createElement('label');
+        labelEl.appendChild(checkbox);
+        labelEl.appendChild(document.createTextNode(' ' + label));
+
+        var upBtn = document.createElement('button');
+        upBtn.type = 'button';
+        upBtn.textContent = '\\u25B2';
+        upBtn.title = 'Mover para cima';
+        upBtn.onclick = function() {{ moveColConfig(idx, -1); }};
+
+        var downBtn = document.createElement('button');
+        downBtn.type = 'button';
+        downBtn.textContent = '\\u25BC';
+        downBtn.title = 'Mover para baixo';
+        downBtn.onclick = function() {{ moveColConfig(idx, 1); }};
+
+        var arrows = document.createElement('span');
+        arrows.className = 'col-config-arrows';
+        arrows.appendChild(upBtn);
+        arrows.appendChild(downBtn);
+
+        var li = document.createElement('li');
+        li.className = 'col-config-item';
+        li.appendChild(labelEl);
+        li.appendChild(arrows);
+        list.appendChild(li);
+      }});
+    }}
+
+    function moveColConfig(idx, dir) {{
+      var newIdx = idx + dir;
+      if (newIdx < 0 || newIdx >= currentOrder.length) return;
+      var tmp = currentOrder[idx];
+      currentOrder[idx] = currentOrder[newIdx];
+      currentOrder[newIdx] = tmp;
+      renderColConfigList();
+    }}
+
+    function toggleColConfig() {{
+      var panel = document.getElementById('colConfigPanel');
+      panel.style.display = (panel.style.display === 'none') ? '' : 'none';
+    }}
+
+    function applyColConfigFromPanel() {{
+      var selected = currentOrder.filter(function(k) {{ return currentChecked[k]; }});
+      applyColumnConfig(selected);
+      try {{
+        localStorage.setItem(COL_CONFIG_STORAGE_KEY, JSON.stringify({{ order: currentOrder, checked: currentChecked }}));
+      }} catch (e) {{ /* localStorage indisponível (ex.: aberto via file:// em modo restrito) */ }}
+      document.getElementById('colConfigPanel').style.display = 'none';
+    }}
+
+    function resetColConfig() {{
+      currentOrder = ALL_CATEGORIES.map(function(c) {{ return c.key; }});
+      currentChecked = {{}};
+      currentOrder.forEach(function(k) {{ currentChecked[k] = true; }});
+      renderColConfigList();
+      applyColumnConfig(currentOrder);
+      try {{ localStorage.removeItem(COL_CONFIG_STORAGE_KEY); }} catch (e) {{}}
+    }}
+
+    function initColConfig() {{
+      var saved = null;
+      try {{ saved = JSON.parse(localStorage.getItem(COL_CONFIG_STORAGE_KEY) || 'null'); }} catch (e) {{ saved = null; }}
+
+      if (saved && Array.isArray(saved.order) && saved.checked) {{
+        var validOrder = saved.order.filter(function(k) {{
+          return ALL_CATEGORIES.some(function(c) {{ return c.key === k; }});
+        }});
+        ALL_CATEGORIES.forEach(function(c) {{
+          if (validOrder.indexOf(c.key) === -1) validOrder.push(c.key);
+        }});
+        currentOrder = validOrder;
+        currentChecked = {{}};
+        currentOrder.forEach(function(k) {{
+          currentChecked[k] = saved.checked[k] !== undefined ? !!saved.checked[k] : true;
+        }});
+      }} else {{
+        currentOrder = ALL_CATEGORIES.map(function(c) {{ return c.key; }});
+        currentChecked = {{}};
+        currentOrder.forEach(function(k) {{ currentChecked[k] = true; }});
+      }}
+
+      renderColConfigList();
+      applyColumnConfig(currentOrder.filter(function(k) {{ return currentChecked[k]; }}));
+    }}
+
+    initColConfig();
   </script>
 </body>
 </html>"""
