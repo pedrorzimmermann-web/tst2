@@ -27,7 +27,7 @@ _COMPILED_RULES = [
 # Colunas fixas (não configuráveis) que sempre precedem as de categoria
 # nas tabelas do HTML + margem de segurança para o colspan das linhas
 # de drill-down.
-FIXED_COLUMNS_HTML = 4
+FIXED_COLUMNS_HTML = 5
 DETAIL_COLSPAN = FIXED_COLUMNS_HTML + len(CATEGORIES) + 4
 
 # Máximo de eventos exibidos POR CATEGORIA no drill-down do HTML (em vez de
@@ -155,6 +155,7 @@ def aggregate_events(rows, top_n: int):
     para o subconjunto de linhas de um único cluster.
     """
     per_host_total = Counter()
+    per_host_matched = Counter()
     per_host_cat = {c: Counter() for c in CATEGORIES}
     samples = defaultdict(lambda: defaultdict(list))
     host_events = defaultdict(list)
@@ -164,6 +165,11 @@ def aggregate_events(rows, top_n: int):
         per_host_total[host] += 1
 
         cats = categorize(r["Detalhes"])
+        if cats:
+            # conta a LINHA (não a categoria) — um evento com 2+ categorias
+            # ainda soma só 1 aqui, por isso pode ser menor que a soma das
+            # colunas de categoria individualmente.
+            per_host_matched[host] += 1
         for c in cats:
             per_host_cat[c][host] += 1
             if len(samples[host][c]) < 3:
@@ -188,13 +194,18 @@ def aggregate_events(rows, top_n: int):
 
     hosts_sorted = sorted(per_host_total.keys(), key=sort_key, reverse=True)
 
-    totals = {"hosts_afetados": len(hosts_sorted), "total_events": sum(per_host_total.values())}
+    totals = {
+        "hosts_afetados": len(hosts_sorted),
+        "total_events": sum(per_host_total.values()),
+        "matched_events": sum(per_host_matched.values()),
+    }
     for c in CATEGORIES:
         totals[c] = sum(per_host_cat[c].values())
 
     return {
         "hosts_sorted": hosts_sorted,
         "per_host_total": per_host_total,
+        "per_host_matched": per_host_matched,
         "per_host_cat": per_host_cat,
         "samples": samples,
         "host_events": host_events,
@@ -207,10 +218,11 @@ def render_scope_report_text(agg, top_n: int, title: str = None):
     if title:
         lines.append(title)
     lines.append(f"TOP {top_n} hosts (consolidado):")
-    lines.append("Hostname | total | " + " | ".join(CATEGORIES))
+    lines.append("(total = todas as linhas do Monit no período; eventos_c_regra = quantas bateram alguma categoria)")
+    lines.append("Hostname | total | eventos_c_regra | " + " | ".join(CATEGORIES))
     for h in agg["hosts_sorted"][:top_n]:
         cat_values = " | ".join(str(agg["per_host_cat"][c][h]) for c in CATEGORIES)
-        lines.append(f"{h} | {agg['per_host_total'][h]} | {cat_values}")
+        lines.append(f"{h} | {agg['per_host_total'][h]} | {agg['per_host_matched'][h]} | {cat_values}")
 
     lines.append("")
     lines.append("TOP por categoria:")
@@ -272,11 +284,12 @@ def generate_reports(rows, days_window: int, top_n: int = 15):
         global_agg = aggregate_events(filtered, top_n)
         report.extend(render_scope_report_text(global_agg, top_n))
 
-        summary_lines = [["Hostname", "total_events"] + CATEGORIES]
+        summary_lines = [["Hostname", "total_events", "matched_events"] + CATEGORIES]
         for h in global_agg["hosts_sorted"]:
             t = global_agg["per_host_total"]
+            m = global_agg["per_host_matched"]
             c = global_agg["per_host_cat"]
-            summary_lines.append([h, str(t[h])] + [str(c[cat][h]) for cat in CATEGORIES])
+            summary_lines.append([h, str(t[h]), str(m[h])] + [str(c[cat][h]) for cat in CATEGORIES])
     else:
         cluster_rows = defaultdict(list)
         for r in filtered:
@@ -290,11 +303,12 @@ def generate_reports(rows, days_window: int, top_n: int = 15):
         clusters_sorted = sorted(clusters, key=cluster_sort_key, reverse=True)
 
         report.append(f"ÍNDICE DE CLUSTERS ({len(clusters_sorted)}):")
-        report.append("Cluster | hosts_afetados | total | " + " | ".join(CATEGORIES))
+        report.append("(total = todas as linhas do Monit no período; eventos_c_regra = quantas bateram alguma categoria)")
+        report.append("Cluster | hosts_afetados | total | eventos_c_regra | " + " | ".join(CATEGORIES))
         for c in clusters_sorted:
             t = cluster_aggs[c]["totals"]
             cat_values = " | ".join(str(t[cat]) for cat in CATEGORIES)
-            report.append(f"{c} | {t['hosts_afetados']} | {t['total_events']} | {cat_values}")
+            report.append(f"{c} | {t['hosts_afetados']} | {t['total_events']} | {t['matched_events']} | {cat_values}")
         report.append("")
 
         for c in clusters_sorted:
@@ -304,13 +318,14 @@ def generate_reports(rows, days_window: int, top_n: int = 15):
             report.extend(render_scope_report_text(cluster_aggs[c], top_n))
             report.append("")
 
-        summary_lines = [["Cluster", "Hostname", "total_events"] + CATEGORIES]
+        summary_lines = [["Cluster", "Hostname", "total_events", "matched_events"] + CATEGORIES]
         for c in clusters_sorted:
             agg = cluster_aggs[c]
             t = agg["per_host_total"]
+            m = agg["per_host_matched"]
             pc = agg["per_host_cat"]
             for h in agg["hosts_sorted"]:
-                summary_lines.append([c, h, str(t[h])] + [str(pc[cat][h]) for cat in CATEGORIES])
+                summary_lines.append([c, h, str(t[h]), str(m[h])] + [str(pc[cat][h]) for cat in CATEGORIES])
 
     report.append("")
     report.append("Recomendação operacional:")
@@ -337,13 +352,17 @@ def write_text(path, content: str):
 
 def render_markdown_scope_table(agg, top_n: int):
     lines = []
-    lines.append("| Hostname | Total | " + " | ".join(CATEGORY_LABELS[c] for c in CATEGORIES) + " |")
-    lines.append("|---|---:|" + "---:|" * len(CATEGORIES))
+    lines.append(
+        "| Hostname | Total | Eventos c/ regra | "
+        + " | ".join(CATEGORY_LABELS[c] for c in CATEGORIES) + " |"
+    )
+    lines.append("|---|---:|---:|" + "---:|" * len(CATEGORIES))
     for h in agg["hosts_sorted"][:top_n]:
         t = agg["per_host_total"]
+        m = agg["per_host_matched"]
         c = agg["per_host_cat"]
         cat_values = " | ".join(str(c[cat][h]) for cat in CATEGORIES)
-        lines.append(f"| {h} | {t[h]} | {cat_values} |")
+        lines.append(f"| {h} | {t[h]} | {m[h]} | {cat_values} |")
     return lines
 
 def render_markdown_report(report_data: dict, top_n: int = 15):
@@ -354,12 +373,15 @@ def render_markdown_report(report_data: dict, top_n: int = 15):
     if report_data["multi_cluster"]:
         md.append("## Índice de clusters")
         md.append("")
-        md.append("| Cluster | Hosts afetados | Total | " + " | ".join(CATEGORY_LABELS[c] for c in CATEGORIES) + " |")
-        md.append("|---|---:|---:|" + "---:|" * len(CATEGORIES))
+        md.append(
+            "| Cluster | Hosts afetados | Total | Eventos c/ regra | "
+            + " | ".join(CATEGORY_LABELS[c] for c in CATEGORIES) + " |"
+        )
+        md.append("|---|---:|---:|---:|" + "---:|" * len(CATEGORIES))
         for c in report_data["clusters_sorted"]:
             t = report_data["cluster_aggs"][c]["totals"]
             cat_values = " | ".join(str(t[cat]) for cat in CATEGORIES)
-            md.append(f"| {c} | {t['hosts_afetados']} | {t['total_events']} | {cat_values} |")
+            md.append(f"| {c} | {t['hosts_afetados']} | {t['total_events']} | {t['matched_events']} | {cat_values} |")
         md.append("")
 
         for c in report_data["clusters_sorted"]:
@@ -514,6 +536,7 @@ def render_top_hosts_table_html(agg: dict, id_prefix: str):
             "</td>"
             f"<td>{match_badge}</td>"
             f"<td class='num'>{t[h]}</td>"
+            f"<td class='num'>{agg['per_host_matched'][h]}</td>"
             f"<td>{bar(t[h])}</td>"
             f"{row_cats}"
             "</tr>"
@@ -530,7 +553,8 @@ def render_top_hosts_table_html(agg: dict, id_prefix: str):
         "<thead><tr>"
         "<th data-sort-type='text-natural'>Hostname</th>"
         "<th data-sort-type='text'>Correspondência</th>"
-        "<th data-sort-type='num'>Total</th>"
+        "<th data-sort-type='num' title='Todas as linhas do Monit deste host no período, batendo regra ou não'>Total</th>"
+        "<th data-sort-type='num' title='Quantas dessas linhas bateram pelo menos uma regra de categorização'>Eventos c/ regra</th>"
         "<th>Visual</th>"
         f"{header_cats}"
         "</tr></thead>"
@@ -568,6 +592,7 @@ def render_html_report(report_data: dict):
                 f"<td>{match_badge}</td>"
                 f"<td class='num'>{t['hosts_afetados']}</td>"
                 f"<td class='num'>{t['total_events']}</td>"
+                f"<td class='num'>{t['matched_events']}</td>"
                 f"{index_row_cats}"
                 "</tr>"
             )
@@ -586,7 +611,8 @@ def render_html_report(report_data: dict):
         <th data-sort-type="text-natural">Cluster</th>
         <th data-sort-type="text">Correspondência</th>
         <th data-sort-type="num">Hosts afetados</th>
-        <th data-sort-type="num">Total</th>
+        <th data-sort-type="num" title="Todas as linhas do Monit deste cluster no período, batendo regra ou não">Total</th>
+        <th data-sort-type="num" title="Quantas dessas linhas bateram pelo menos uma regra de categorização">Eventos c/ regra</th>
         {index_header_cats}
       </tr>
     </thead>
@@ -703,6 +729,7 @@ def render_html_report(report_data: dict):
 
   <div class="note">
     <b>Orientação operacional:</b> priorizar abertura de registros individuais para hosts com maior reincidência (categorias no topo da lista de regras).
+    <br/>"Total" conta todas as linhas do Monit no período (batendo regra ou não); "Eventos c/ regra" conta só as que bateram alguma categoria — a diferença é esperada quando o host tem bastante tráfego de rotina do Monit sem relação com as regras.
   </div>
 
   <div class="toolbar">
@@ -1029,10 +1056,17 @@ def render_audit_report(rows: list, days_window: int, hostname: str) -> str:
         else:
             no_match.append((r["Date"], raw))
 
+    matched_lines = len(host_rows) - len(no_match)
+
     lines = []
     lines.append(f"AUDITORIA — {hostname}")
     lines.append(f"Janela analisada (últimos {days_window} dias): {start:%Y-%m-%d %H:%M:%S} até {now:%Y-%m-%d %H:%M:%S}")
-    lines.append(f"Total de linhas do host no período (antes de categorizar): {len(host_rows)}")
+    lines.append(f"Total de linhas do host no período (batendo regra ou não): {len(host_rows)}")
+    lines.append(f"Linhas que bateram alguma regra: {matched_lines}")
+    lines.append(
+        "(a soma das categorias abaixo pode ser MAIOR que 'linhas que bateram alguma regra' "
+        "se uma mesma linha bater mais de uma categoria ao mesmo tempo)"
+    )
     lines.append("")
 
     for c in CATEGORIES:
